@@ -1,0 +1,567 @@
+---
+title: "Compare RFSI method vs RF (ignoring locations) method and evaluate performance"
+author: "Narin Polat Öztürk"
+format: 
+  typst:
+    fig-format: png
+editor: visual
+---
+
+**Task:** Use the meuse data set and focus on “zinc” variable; compare performance of using RFSI method vs simple RF using 5–fold cross-validation: “Is there a difference in accuracy between the two methods?” try adding new covariate layers such as the inundated water and similar and see if this changes results.
+
+## 1. Load the required packages
+
+First, install the packages if they are not already installed.
+
+The packeages are used for the following purposes: 
+
+- sp: provides the Meuse data set.
+- meteo: creates nearest-neighbour variables required for RFSI.
+- ranger: fits Random Forest models.
+- ggplot2: creates figures.
+- dplyr and tidyr: data manipulation.
+- terra: handling additional raster covariates.
+
+```{r}
+#| warning: false
+#| message: false
+# Libraries
+library(sp)
+library(meteo)
+library(ranger)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(terra)
+```
+# 2. Load the Meuse data
+
+The Meuse data set contains heavy-metal concentrations measured in the floodplain of the Meuse River.
+
+```{r}
+# Downloading muse dataset 
+data(meuse, package = "sp")
+data(meuse.grid, package = "sp")
+
+```
+
+## 3. Define the baseline covariates
+
+The same environmental covariates should be supplied to both RF and RFSI so that the comparison is fair.
+
+```{r}
+# Defining the covars
+covars <- c("dist", "ffreq", "soil")
+names(meuse.grid)
+
+meuse$ffreq <- factor(meuse$ffreq)
+meuse$soil <- factor(meuse$soil)
+
+meuse.grid$ffreq <- factor(meuse.grid$ffreq, levels = levels(meuse$ffreq))
+meuse.grid$soil <- factor(meuse.grid$soil, levels = levels(meuse$soil))
+```
+The baseline Random Forest therefore represents a model that uses environmental covariates but does not explicitly use geographical coordinates or neighbouring zinc observations.
+
+## 4. Explore the distribution of zinc
+
+Before fitting the models, inspect the response variable.
+
+```{r}
+# Distribution of zinc
+summary(meuse$zinc)
+ggplot(meuse, aes(x = zinc)) +
+  geom_histogram(bins = 25) +
+  theme_minimal() +
+  labs(x = "Zinc (mg/kg)", 
+       y = "Frequency", 
+       title = "Distribution of zinc concentrations")
+```
+Zinc concentrations are expected to show a right-skewed distribution.
+For the initial comparison, the models can be fitted directly to the original zinc values. A log-transformed version can later be tested as a sensitivity analysis
+
+## 5. Create 5-fold cross-validation
+
+The observations are divided into five approximately equal groups.
+
+```{r}
+# 5-fold cross validation
+set.seed(42)
+
+n <- nrow(meuse)
+
+fold_id <- sample(rep(1:5, length.out = n))
+table(fold_id)
+```
+The same folds must be used for both RF and RFSI.
+
+This is important because otherwise differences in model performance could partly result from different train-validation partitions rather than from the modelling method itself.
+
+## 6. Fit the baseline Random Forest
+
+```{r}
+# Random Forest (RF)
+train_id <- which(fold_id != 1)
+test_id  <- which(fold_id == 1)
+# training
+train <- meuse[train_id, ]
+# validation
+test <- meuse[test_id, ]
+# RF model
+rf_model <- ranger(
+  zinc ~ dist + ffreq + soil,
+  data = train,
+  num.trees = 500,
+  seed = 42
+)
+
+# prediction
+rf_pred <- predict(rf_model, data = test)$predictions
+
+head(rf_pred)
+```
+It also does not use zinc concentrations measured at neighbouring sampling locations.
+Therefore, this represents the RF ignoring locations method required in the assignment.
+
+## 7. Construct the spatial predictors for RFSI
+
+The main difference between standard RF and RFSI is that RFSI introduces information from neighbouring observations.
+
+```{r}
+# Random Forest Spatial Interpolation (RFS)
+nearest_train <- near.obs(
+  locations = train,
+  locations.x.y = c("x", "y"),
+  observations = train,
+  observations.x.y = c("x", "y"),
+  obs.col = "zinc",
+  n.obs = 10,
+  rm.dupl = TRUE
+)
+rm.dupl = TRUE
+head(nearest_train)
+```
+
+## 8. Calculate spatial predictors for the validation data 
+
+This is the most important part of the cross-validation procedure. For validation locations, neighbouring observations must be searched only within the training data.
+```{r}
+# Calculating neasrest validation points 
+observations = meuse
+nearest_test <- near.obs(
+  locations = test,
+  locations.x.y = c("x", "y"),
+  observations = train,
+  observations.x.y = c("x", "y"),
+  obs.col = "zinc",
+  n.obs = 10,
+  rm.dupl = TRUE
+)
+observations = train
+```
+This prevents validation zinc concentrations from being used as predictors.
+
+If all Meuse observations were used before cross-validation, the validation observations could become neighbours of one another and information would leak from the validation set into the model.
+
+That would artificially improve the apparent performance of RFSI.
+
+## 9. Combine the environmental and spatial predictors 
+
+```{r}
+# Determining the RFSI datasets
+#training
+train_rfsi <- cbind(train, nearest_train)
+# validation
+test_rfsi <- cbind(test, nearest_test)
+# control
+names(train_rfsi)
+
+```
+
+## 10. Create the RFSI formula
+
+```{r}
+# Creating the RFSI formula 
+dist_vars <- paste0("dist", 1:10)
+obs_vars <- paste0("obs", 1:10)
+rfsi_vars <- c(covars, dist_vars, obs_vars)
+rfsi_formula <- reformulate(rfsi_vars, response = "zinc")
+rfsi_formula
+```
+
+## 11. Fit the RFSO model 
+
+Fit Random Forest using both environmental covariates and spatial neighbour variables.
+
+```{r}
+# Learning RFSI model
+rfsi_model <- ranger(
+  formula = rfsi_formula,
+  data = train_rfsi,
+  num.trees = 500,
+  seed = 42
+)
+rfsi_pred <- predict(rfsi_model, data = test_rfsi)$predictions
+
+head(data.frame(
+    observed = test$zinc,
+    RF = rf_pred,
+    RFSI = rfsi_pred
+))
+```
+At this stage, predictions from both approaches for Fold 1.
+
+## 12. Run the complete 5-fold cross-validation
+
+```{r}
+# 5 fold cycle process
+cv_results <- data.frame()
+for (fold in 1:5) {
+  
+  # --------------------
+  # Training / validation
+  # --------------------
+  
+  train_id <- which(fold_id != fold)
+  test_id  <- which(fold_id == fold)
+  
+  train <- meuse[train_id, ]
+  test  <- meuse[test_id, ]
+  
+  
+  # =========================================================
+  # RF
+  # =========================================================
+  
+  rf_model <- ranger(
+    zinc ~ dist + ffreq + soil,
+    data = train,
+    num.trees = 500,
+    seed = 42 + fold
+  )
+  
+  rf_pred <- predict(rf_model, data = test)$predictions
+  
+  
+  # =========================================================
+  # RFSI
+  # =========================================================
+  
+  nearest_train <- near.obs(
+    locations = train,
+    locations.x.y = c("x", "y"),
+    observations = train,
+    observations.x.y = c("x", "y"),
+    obs.col = "zinc",
+    n.obs = 10,
+    rm.dupl = TRUE
+  )
+  
+  nearest_test <- near.obs(
+    locations = test,
+    locations.x.y = c("x", "y"),
+    observations = train,
+    observations.x.y = c("x", "y"),
+    obs.col = "zinc",
+    n.obs = 10,
+    rm.dupl = TRUE
+  )
+  
+  train_rfsi <- cbind(train, nearest_train)
+  test_rfsi <- cbind(test, nearest_test)
+  
+  rfsi_model <- ranger(
+    formula = rfsi_formula,
+    data = train_rfsi,
+    num.trees = 500,
+    seed = 42 + fold
+  )
+  
+  rfsi_pred <- predict(rfsi_model, data = test_rfsi)$predictions
+  
+  
+  # =========================================================
+
+  # =========================================================
+  
+  fold_results <- data.frame(
+    fold = fold,
+    observed = test$zinc,
+    RF = rf_pred,
+    RFSI = rfsi_pred
+  )
+  
+  cv_results <- rbind(cv_results, fold_results)
+}
+
+```
+## 13. Calculate RMSE
+
+RMSE measures the average magnitude of prediction errors while giving relatively high weight to large errors.
+
+```{r}
+# Calculation the RMSE
+rmse <- function(obs, pred) {
+  sqrt(mean((obs - pred)^2))
+}
+# RF
+rmse_rf <- rmse(cv_results$observed, cv_results$RF)
+# RFSI 
+rmse_rfsi <- rmse(cv_results$observed,cv_results$RFSI)
+
+```
+## 14. Calculate MAE
+
+MAE represent the average absolute prediction error.
+
+```{r}
+# calculating MAE 
+mae <- function(obs, pred) {
+  mean(abs(obs - pred))
+}
+
+mae_rf <- mae(cv_results$observed,cv_results$RF)
+mae_rfsi <- mae(cv_results$observed, cv_results$RFSI)
+
+```
+
+## 15. Calculate R2
+
+R² describes how closely predicted and observed values are associated.
+
+```{r}
+
+# Calculating R2
+r2 <- function(obs, pred) {
+  cor(obs, pred)^2
+}
+
+r2_rf <- r2(cv_results$observed, cv_results$RF)
+r2_rfsi <- r2(cv_results$observed, cv_results$RFSI)
+
+```
+
+Higher R² indicates better agreement between observed and predicted values.
+
+## 16. Create the performance table
+
+Combine the metrics into one table.
+
+```{r}
+# Result figures
+performance <- data.frame(
+  Model = c("RF", "RFSI"),
+  RMSE = c(rmse_rf, rmse_rfsi),
+  MAE = c(mae_rf, mae_rfsi),
+  R2 = c(r2_rf, r2_rfsi)
+)
+performance
+```
+## 17. Calculate the relative improvement of RFSI
+
+The percentage reduction in RMSE can make the comparison easier to interpret.
+
+```{r}
+# Calculating the percentage improvement in the RFSI.
+
+rmse_improvement <- 100 * (rmse_rf - rmse_rfsi) / rmse_rf
+rmse_improvement
+```
+If the value is negative, standart RF performed better.
+
+## 18. Plot observed versus predicted values
+
+```{r}
+# 18.Observed-predicted plot
+plot_data <- cv_results |>
+  pivot_longer(
+    cols = c(RF, RFSI),
+    names_to = "model",
+    values_to = "predicted"
+  )
+ggplot(plot_data, aes(x = observed, y = predicted)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, linetype = 2) +
+  facet_wrap(~ model) +
+  coord_equal() +
+  theme_minimal() +
+  labs(
+    x = "Observed zinc (mg/kg)",
+    y = "Predicted zinc (mg/kg)",
+    title = "5-fold cross-validation"
+  )
+```
+Points closer to the 1:1 line indicate better predictions.
+
+## 19. Compare absolute prediction errors
+
+```{r}
+# Comparing the errors
+error_data <- cv_results |>
+  mutate(
+    error_RF = abs(observed - RF),
+    error_RFSI = abs(observed - RFSI)
+  )
+error_long <- error_data |>
+  select(error_RF, error_RFSI) |>
+  pivot_longer(everything(), names_to = "model", values_to = "absolute_error")
+
+ggplot(error_long, aes(x = model, y = absolute_error)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    x = NULL,
+    y = "Absolute error (mg/kg)",
+    title = "RF vs RFSI prediction errors"
+  )
+```
+This figure shows whether RFSI generally produces smaller errors than standart RF. 
+
+## 20. Compare errors statistically
+
+Because both models predict exactly the same validation observations, their errors are paired.
+
+```{r}
+# Statistical difference between two models
+wilcox.test(error_data$error_RF, error_data$error_RFSI, paired = TRUE)
+```
+However, this result should be interpreted cautiously because spatial observations are not necessarily statistically independent.
+Therefore, the primary evaluation should still rely on:
+RMSE
+MAE
+R²
+consistency among the five folds
+rather than only on the p-value.
+
+## 21. Calculate performance separately for each fold 
+
+It is useful to check whether one method consistently performs better or whether the overall difference is driven by only one cross-validation fold.
+```{r}
+# Looking at the performance on a fold basis
+
+fold_metrics <- cv_results |>
+group_by(fold) |>
+  summarise(
+    RMSE_RF = sqrt(mean((observed - RF)^2)),
+    RMSE_RFSI = sqrt(mean((observed - RFSI)^2)),
+    MAE_RF = mean(abs(observed - RF)),
+    MAE_RFSI = mean(abs(observed - RFSI))
+  )
+fold_metrics
+```
+
+## 22. Fit the final Random Forest model
+
+Cross-validation is used to evaluate model performance.
+
+After evaluation, a final model can be trained using all available observations to create the prediction map.
+
+```{r}
+# Last model
+rf_final <- ranger(
+  zinc ~ dist + ffreq + soil,
+  data = meuse,
+  num.trees = 500,
+  seed = 42
+)
+meuse.grid$zinc_RF <- predict(rf_final, data = meuse.grid)$predictions
+```
+
+## 23. Fit the final RFSI model 
+First calculate nearest neighbours among the complete set of observations.
+```{r}
+# Fit the final RFSI model 
+nearest_meuse <- near.obs(
+  locations = meuse,
+  locations.x.y = c("x", "y"),
+  observations = meuse,
+  observations.x.y = c("x", "y"),
+  obs.col = "zinc",
+  n.obs = 10,
+  rm.dupl = TRUE
+)
+
+meuse_rfsi <- cbind(meuse, nearest_meuse)
+
+rfsi_final <- ranger(
+  formula = rfsi_formula,
+  data = meuse_rfsi,
+  num.trees = 500,
+  seed = 42
+)
+
+```
+
+## 24. Calculate nearest neighbours for the prediction grid
+
+For every grid cell, identify the ten nearest Meuse observations.
+
+```{r}
+# Calculate nearest neighbours for the prediction grid
+nearest_grid <- near.obs(
+  locations = meuse.grid,
+  locations.x.y = c("x", "y"),
+  observations = meuse,
+  observations.x.y = c("x", "y"),
+  obs.col = "zinc",
+  n.obs = 10,
+  rm.dupl = TRUE
+)
+grid_rfsi <- cbind(meuse.grid, nearest_grid)
+meuse.grid$zinc_RFSI <- predict(rfsi_final, data = grid_rfsi)$predictions
+```
+
+## 25. Calculate differences between the two prediction maps
+
+The assignment specifically asks for a visual comparison of prediction differences.
+
+```{r}
+# Calculate differences between the two prediction maps 
+meuse.grid$diff <- meuse.grid$zinc_RFSI - meuse.grid$zinc_RF
+
+```
+
+## 26. Plot the Random Forest prediction map
+
+```{r}
+# Plot the Random Forest prediction map
+ggplot(meuse.grid, aes(x = x, y = y, fill = zinc_RF)) +
+  geom_raster() +
+  geom_point(data = meuse, aes(x = x, y = y), inherit.aes = FALSE, size = 0.5) +
+  coord_equal() +
+  theme_minimal() +
+  labs(fill = "Zinc", title = "Random Forest prediction")
+```
+
+## 27. Plot the RFSI prediction map
+
+```{r}
+# Plot the RFSI prediction map
+ggplot(meuse.grid, aes(x = x, y = y, fill = zinc_RFSI)) +
+  geom_raster() +
+  geom_point(data = meuse, aes(x = x, y = y), inherit.aes = FALSE, size = 0.5) +
+  coord_equal() +
+  theme_minimal() +
+  labs(fill = "Zinc", title = "RFSI prediction")
+```
+
+## 28. Plot the differences between RFSI and RF
+
+This is probably one of the most important figures for the assignment.
+
+```{r}
+# Plot the difference between RFSI and RF
+ggplot(meuse.grid, aes(x = x, y = y, fill = diff)) +
+  geom_raster() +
+  geom_point(data = meuse, aes(x = x, y = y), inherit.aes = FALSE, size = 0.5) +
+  coord_equal() +
+  scale_fill_gradient2(midpoint = 0) +
+  theme_minimal() +
+  labs(fill = "RFSI - RF", title = "Difference between RFSI and RF predictions")
+```
+This map allows us to identify the locations where explicitly incorporating spatial neighbourhood information changes the predicted zinc concentrations.
+
+## References
+
+Sekulić, A., Kilibarda, M., Heuvelink, G. B. M., Nikolić, M., & Bajat, B. (2020). Random Forest Spatial Interpolation. Remote Sensing, 12(10), 1687. https://doi.org/10.3390/rs12101687
+
+Hengl, T., Parente, L., & Bonannella, C. (2022). Spatial and Spatiotemporal Interpolation / Prediction using Ensemble Machine Learning (Version v0.1). Zenodo. https://doi.org/10.5281/zenodo.5894924
